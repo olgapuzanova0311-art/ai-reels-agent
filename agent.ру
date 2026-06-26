@@ -1,0 +1,171 @@
+"""
+Оркестратор агента
+"""
+import asyncio
+import os
+import json
+import hashlib
+import tempfile
+import logging
+from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from core.youtube_parser import search_youtube_shorts, download_audio, find_downloaded_file
+from core.transcriber import transcribe_audio
+from core.adapter import adapt_content
+from bot.sender import send_card, send_summary, send_alert
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("agent")
+
+VIDEOS_PER_RUN = int(os.getenv("VIDEOS_PER_RUN", 30))
+KEYWORDS = [k.strip() for k in os.getenv(
+    "SEARCH_KEYWORDS",
+    "нейросети,ChatGPT,ИИ,AI,midjourney,llm"
+).split(",") if k.strip()]
+
+SEEN_FILE = "seen_videos.json"
+
+
+def load_seen() -> set:
+    if os.path.exists(SEEN_FILE):
+        try:
+            with open(SEEN_FILE) as f:
+                return set(json.load(f)[-3000:])
+        except Exception:
+            pass
+    return set()
+
+
+def save_seen(seen: set) -> None:
+    with open(SEEN_FILE, "w") as f:
+        json.dump(list(seen)[-3000:], f)
+
+
+def video_key(v: dict) -> str:
+    return hashlib.md5(f"yt:{v['video_id']}".encode()).hexdigest()
+
+
+async def process_video(video: dict, tmp_dir: str) -> dict:
+    vid_id = video["video_id"]
+    
+    # Скачиваем аудио
+    base_path = os.path.join(tmp_dir, f"yt_{vid_id}")
+    try:
+        ok = await download_audio(vid_id, base_path)
+    except Exception as e:
+        return {"success": False, "error": f"download exception: {e}"}
+    
+    if not ok:
+        return {"success": False, "error": "download failed (yt-dlp вернул False)"}
+
+    audio_path = find_downloaded_file(base_path)
+    if not audio_path:
+        # Покажем что есть в tmp_dir
+        files = os.listdir(tmp_dir)
+        return {"success": False, "error": f"файл не найден после скачивания. В папке: {files}"}
+
+    # Транскрибируем
+    try:
+        tr = await transcribe_audio(audio_path)
+    except Exception as e:
+        return {"success": False, "error": f"transcribe exception: {e}"}
+    
+    if not tr["success"] or not tr["text"]:
+        return {"success": False, "error": f"транскрипция: {tr.get('error', 'пустой текст')}"}
+
+    # Адаптируем
+    try:
+        ad = await adapt_content(tr["text"], video)
+    except Exception as e:
+        return {"success": False, "error": f"adapt exception: {e}"}
+    
+    if not ad["success"]:
+        return {"success": False, "error": f"адаптация: {ad.get('error')}"}
+
+    try:
+        os.remove(audio_path)
+    except Exception:
+        pass
+
+    return {"success": True, "transcription": tr["text"], "adaptation": ad}
+
+
+async def run_agent() -> None:
+    logger.info(f"Запуск | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    await send_alert(f"🚀 Агент запущен | {datetime.now().strftime('%H:%M')}\nИщу ролики по {len(KEYWORDS)} ключевым словам...")
+
+    seen = load_seen()
+    stats = {"found": 0, "sent": 0, "skipped": 0, "errors": 0}
+
+    per_keyword = max(5, VIDEOS_PER_RUN // len(KEYWORDS))
+    tasks = [search_youtube_shorts(kw, max_results=per_keyword) for kw in KEYWORDS]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_videos = []
+    for r in results:
+        if isinstance(r, list):
+            all_videos.extend(r)
+        elif isinstance(r, Exception):
+            await send_alert(f"⚠️ Ошибка поиска: {r}")
+
+    seen_ids = set()
+    unique = []
+    for v in all_videos:
+        key = video_key(v)
+        if key not in seen_ids and key not in seen:
+            seen_ids.add(key)
+            unique.append(v)
+        else:
+            stats["skipped"] += 1
+
+    unique.sort(key=lambda x: x.get("views", 0), reverse=True)
+    to_process = unique[:VIDEOS_PER_RUN]
+    stats["found"] = len(all_videos)
+
+    await send_alert(f"📊 Найдено: {len(all_videos)} роликов\nУникальных: {len(unique)}\nОбрабатываю топ {len(to_process)}...")
+
+    if not to_process:
+        await send_alert("❌ Нет роликов для обработки. Возможно MIN_VIEWS слишком высокий или YouTube не отдаёт результаты.")
+        return
+
+    sem = asyncio.Semaphore(2)
+
+    async def process_with_sem(video):
+        async with sem:
+            return video, await process_video(video, tmp_dir)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tasks = [process_with_sem(v) for v in to_process]
+
+        for coro in asyncio.as_completed(tasks):
+            try:
+                video, result = await coro
+                if result["success"]:
+                    sent = await send_card(video, result["transcription"], result["adaptation"])
+                    if sent:
+                        stats["sent"] += 1
+                        seen.add(video_key(video))
+                    await asyncio.sleep(2)
+                else:
+                    stats["errors"] += 1
+                    err_msg = result.get("error", "неизвестная ошибка")
+                    logger.warning(f"Пропуск {video['video_id']}: {err_msg}")
+                    # Шлём первые 3 ошибки в Telegram чтобы понять что происходит
+                    if stats["errors"] <= 3:
+                        await send_alert(f"❌ Ошибка на ролике {video.get('url', '')}:\n{err_msg}")
+            except Exception as e:
+                stats["errors"] += 1
+                await send_alert(f"❌ Необработанная ошибка: {e}")
+
+    save_seen(seen)
+    await send_summary(stats)
+
+
+if __name__ == "__main__":
+    asyncio.run(run_agent())
